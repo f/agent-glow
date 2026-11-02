@@ -4,7 +4,7 @@
   python3 install.py                           install or update
   python3 install.py --uninstall               remove everything it installed
   python3 install.py --agents claude,copilot   register hooks for these agents only
-  python3 install.py --keyboard 4d4c:6505      choose the keyboard when several VIA keyboards are connected
+  python3 install.py --keyboard 4d4c:6505      choose the keyboard when several keyboards are connected
   python3 install.py --no-service              do not run the daemon in the background at login
 
 Installs into ~/.agent-glow (agent_glow.py and a private Python venv with hidapi), registers

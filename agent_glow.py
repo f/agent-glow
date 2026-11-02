@@ -2,7 +2,7 @@
 """agent-glow: blink your keyboard's RGB when Claude Code, Codex or GitHub Copilot is waiting for you.
 
 Usage:
-  agent-glow devices                    list VIA keyboards and whether agent-glow can drive them
+  agent-glow devices                    list usable keyboards and whether agent-glow can drive them
   agent-glow test [AGENT|all|done] [SECONDS]
                                         blink as if an agent were waiting (default: all, 5 seconds)
   agent-glow status                     daemon, keyboard and pending alerts
@@ -19,12 +19,14 @@ Configuration and troubleshooting: https://github.com/f/agent-glow
 """
 # How it works: agent hooks only write a small marker file (stdlib only, always exit 0, never touch
 # the keyboard), so they cannot slow down or break an agent. The daemon watches the markers and
-# drives the keyboard over VIA raw HID. Every light change is a non-saving write, so the lighting
-# stored in the keyboard's EEPROM is never modified. The previous lighting is snapshotted first and
+# drives the keyboard over VIA raw HID, Logitech HID++ or a MacBook's backlight API. Every VIA and MacBook
+# light change is a non-saving write, so the lighting stored in the keyboard's EEPROM is never modified.
+# The previous lighting is snapshotted first and
 # put back when the alert ends; if the daemon dies mid-alert, the snapshot is restored on its next start.
 import json
 import os
 import re
+import struct
 import sys
 import time
 
@@ -49,6 +51,16 @@ HIDPP_ERRORS = (0xFF, 0x8F)
 HIDPP_BLE_PAGE, HIDPP_RECEIVER_PAGE, HIDPP_RECEIVER_USAGE = 0xFF43, 0xFF00, 0x0002
 HIDPP_DIRECT, HIDPP_RECEIVER_SLOTS = 0xFF, range(1, 7)
 HIDPP_SWID, HIDPP_TIMEOUT_MS = 0x0A, 1500
+BACKLIGHT2_HIGH, BACKLIGHT2_LOW = 0x19, 0x82
+BACKLIGHT_GET, BACKLIGHT_SET, BACKLIGHT_RANGE = 0, 1, 2
+BACKLIGHT_MANUAL, BACKLIGHT_MANUAL_BIT, BACKLIGHT_NO_EFFECT = 3, 0x20, 0xFF
+
+MACBOOK = "macbook"
+OBJC_LIBRARY = "/usr/lib/libobjc.A.dylib"
+COREBRIGHTNESS = "/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness"
+MAC_SELECTORS = (b"copyKeyboardBacklightIDs", b"isKeyboardBuiltIn:", b"brightnessForKeyboard:",
+                 b"setBrightness:fadeSpeed:commit:forKeyboard:")
+
 HAPTIC_HIGH, HAPTIC_LOW = 0x19, 0xB0
 HAPTIC_CAPABILITIES, HAPTIC_CONFIGURATION, HAPTIC_PLAY = 0, 1, 4
 HAPTIC_GAP = 1.5
@@ -430,6 +442,10 @@ class Keyboard:
     def lighting(self):
         return {v: k for k, v in LIGHTING.items()}.get(self.channel, str(self.channel))
 
+    @property
+    def details(self):
+        return f"VIA protocol {self.protocol}, {self.lighting}"
+
     @classmethod
     def probe(cls, hid_module, info, lighting="auto"):
         """Open one VIA interface: (Keyboard, None) if its lighting can be driven, else (None, reason)."""
@@ -526,10 +542,37 @@ class Keyboard:
         self.set(ID_SPEED, s["speed"])
 
 
-def haptic_interfaces(hid_module, vid=LOGITECH_VID, pid=0):
-    return [info for info in hid_module.enumerate(vid, pid)
+class HidppTimeout(KeyboardError):
+    pass
+
+
+def hidpp_interfaces(hid_module, vid=0, pid=0):
+    if vid and vid != LOGITECH_VID:
+        return []
+    return [info for info in hid_module.enumerate(LOGITECH_VID, pid)
             if info.get("usage_page") == HIDPP_BLE_PAGE
             or (info.get("usage_page") == HIDPP_RECEIVER_PAGE and info.get("usage") == HIDPP_RECEIVER_USAGE)]
+
+
+def hidpp_exchange(device, feature, function, *params):
+    """Send one HID++ 2.0 request to device.number over device.dev and return the reply's parameters."""
+    call = function << 4 | HIDPP_SWID
+    report = bytes([HIDPP_LONG, device.number, feature, call, *params]).ljust(HIDPP_LONG_SIZE, b"\x00")
+    if device.dev.write(report) < 0:
+        raise KeyboardError("write failed")
+    deadline = time.monotonic() + HIDPP_TIMEOUT_MS / 1000
+    while True:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        reply = device.dev.read(32, remaining) if remaining > 0 else None
+        if not reply:
+            raise HidppTimeout("device did not answer")
+        r = bytes(reply).ljust(HIDPP_LONG_SIZE, b"\x00")
+        if r[0] not in (HIDPP_LONG, HIDPP_SHORT) or r[1] not in (device.number, device.number ^ 0xFF):
+            continue
+        if r[2:4] == bytes([feature, call]):
+            return r[4:]
+        if r[2] in HIDPP_ERRORS and r[3:5] == bytes([feature, call]):
+            raise KeyboardError(f"HID++ error {r[5]:#04x}")
 
 
 def set_open_exclusive(hid_module, exclusive):
@@ -540,6 +583,200 @@ def set_open_exclusive(hid_module, exclusive):
         ctypes.CDLL(hid_module.__file__).hid_darwin_set_open_exclusive(int(exclusive))
     except (AttributeError, ImportError, OSError, TypeError):
         pass
+
+
+class LogiKeyboard(Keyboard):
+    def __init__(self, dev, info=None, number=HIDPP_DIRECT):
+        super().__init__(dev, info)
+        self.number = number
+        self.feature, self.version = 0, 0
+        self.manual, self.levels = False, 0
+        self.enabled, self.options, self.level = 0, 0, 0
+        self.durations = (0, 0, 0, 0)
+
+    @property
+    def lighting(self):
+        return "backlight"
+
+    @property
+    def details(self):
+        return f"HID++ backlight v{self.version}, white only"
+
+    @classmethod
+    def probe(cls, hid_module, info, lighting="auto"):
+        dev = hid_module.device()
+        set_open_exclusive(hid_module, False)
+        try:
+            dev.open_path(info["path"])
+        except (OSError, ValueError, KeyError) as e:
+            hint = " (on Linux: see `agent-glow udev-rule`)" if sys.platform.startswith("linux") else ""
+            return None, f"cannot open it: {e}{hint}"
+        finally:
+            set_open_exclusive(hid_module, True)
+        kb = cls(dev, info)
+        reason = "it has no HID++ backlight"
+        slots = (HIDPP_DIRECT,) if info.get("usage_page") == HIDPP_BLE_PAGE else HIDPP_RECEIVER_SLOTS
+        for number in slots:
+            kb.number = number
+            try:
+                if kb.find_backlight():
+                    return kb, None
+            except OSError as e:
+                reason = f"it did not answer: {e}"
+        kb.close()
+        return None, reason
+
+    @classmethod
+    def open(cls, hid_module=None, vid=0, pid=0, lighting="auto"):
+        hid_module = hid_module or load_hid()
+        reasons = []
+        for info in hidpp_interfaces(hid_module, vid, pid):
+            kb, reason = cls.probe(hid_module, info, lighting)
+            if kb:
+                return kb
+            reasons.append(f"{device_id(info)} {device_name(info)}: {reason}")
+        if reasons:
+            raise KeyboardError("; ".join(reasons))
+        return None
+
+    def request(self, feature, function, *params):
+        try:
+            return self.exchange(feature, function, *params)
+        except HidppTimeout:
+            return self.exchange(feature, function, *params)
+
+    def exchange(self, feature, function, *params):
+        return hidpp_exchange(self, feature, function, *params)
+
+    def find_backlight(self):
+        index, _kind, version = self.request(0, 0, BACKLIGHT2_HIGH, BACKLIGHT2_LOW)[:3]
+        if not index:
+            return False
+        self.feature, self.version = index, version
+        supported = self.read_config()
+        self.levels = self.request(index, BACKLIGHT_RANGE)[0] if version >= 3 else 0
+        self.manual = bool(supported & BACKLIGHT_MANUAL_BIT) and self.levels > 1
+        return True
+
+    def read_config(self):
+        r = self.request(self.feature, BACKLIGHT_GET)
+        self.enabled, self.options, supported, _effects, level, *durations = struct.unpack("<BBBHBHHHH", r[:14])
+        self.level = level if self.mode(self.options) == BACKLIGHT_MANUAL else 0
+        self.durations = tuple(durations)
+        return supported
+
+    @staticmethod
+    def mode(options):
+        return options >> 3 & 0x03
+
+    def write_config(self, enabled, options, level):
+        level = level if self.mode(options) == BACKLIGHT_MANUAL else 0
+        self.request(self.feature, BACKLIGHT_SET, *struct.pack(
+            "<BBBBHHHH", enabled, options, BACKLIGHT_NO_EFFECT, level, *self.durations))
+        self.enabled, self.options, self.level = enabled, options, level
+
+    def set(self, value_id, *values):
+        if value_id != ID_BRIGHTNESS:
+            return
+        if not values[0]:
+            self.write_config(0, self.options, self.level)
+        elif self.manual:
+            level = max(1, round(values[0] * (self.levels - 1) / 255))
+            self.write_config(1, self.options & 0x07 | BACKLIGHT_MANUAL << 3, level)
+        else:
+            self.write_config(1, self.options, 0)
+
+    def read_state(self):
+        self.read_config()
+        return {"effect": self.options, "brightness": self.level, "speed": self.enabled, "hue": 0, "sat": 0}
+
+    def alert(self, hue, sat, brightness):
+        self.set(ID_BRIGHTNESS, brightness)
+
+    def restore(self, s):
+        self.write_config(s["speed"], s["effect"], s["brightness"])
+
+
+class MacBacklight:
+    def __init__(self, objc):
+        self.objc = objc
+        self.client, self.keyboard = None, None
+
+    def send(self, target, selector, restype, argtypes=(), *args):
+        import ctypes
+        call = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(("objc_msgSend", self.objc))
+        return call(target, self.objc.sel_registerName(selector), *args)
+
+    @classmethod
+    def find(cls):
+        if sys.platform != "darwin":
+            return None
+        import ctypes
+        try:
+            objc = ctypes.CDLL(OBJC_LIBRARY)
+            ctypes.CDLL(COREBRIGHTNESS)
+        except OSError:
+            return None
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.class_getInstanceMethod.restype = ctypes.c_void_p
+        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        klass = objc.objc_getClass(b"KeyboardBrightnessClient")
+        if not klass or not all(objc.class_getInstanceMethod(klass, objc.sel_registerName(s)) for s in MAC_SELECTORS):
+            return None
+        self = cls(objc)
+        pointer, ull = ctypes.c_void_p, ctypes.c_ulonglong
+        self.client = self.send(self.send(klass, b"alloc", pointer), b"init", pointer)
+        ids = self.send(self.client, b"copyKeyboardBacklightIDs", pointer) if self.client else None
+        for i in range(self.send(ids, b"count", ctypes.c_ulong) if ids else 0):
+            item = self.send(ids, b"objectAtIndex:", pointer, (ctypes.c_ulong,), i)
+            keyboard = self.send(item, b"unsignedLongLongValue", ull)
+            if self.send(self.client, b"isKeyboardBuiltIn:", ctypes.c_bool, (ull,), keyboard):
+                self.keyboard = keyboard
+                return self
+        return None
+
+    def brightness(self):
+        import ctypes
+        return self.send(self.client, b"brightnessForKeyboard:", ctypes.c_float, (ctypes.c_ulonglong,), self.keyboard)
+
+    def set_brightness(self, value):
+        import ctypes
+        if not self.send(self.client, b"setBrightness:fadeSpeed:commit:forKeyboard:", ctypes.c_bool,
+                         (ctypes.c_float, ctypes.c_int, ctypes.c_bool, ctypes.c_ulonglong),
+                         value, 0, False, self.keyboard):
+            raise KeyboardError("macOS refused the keyboard brightness change")
+
+
+class MacKeyboard:
+    id, name, lighting = "apple:builtin", "MacBook built-in keyboard", "backlight"
+    details = "macOS backlight, white only"
+
+    def __init__(self, backlight):
+        self.backlight = backlight
+
+    @classmethod
+    def open(cls):
+        backlight = MacBacklight.find()
+        return cls(backlight) if backlight else None
+
+    def close(self):
+        pass
+
+    def read_state(self):
+        return {"effect": 0, "brightness": round(self.backlight.brightness() * 255), "speed": 0, "hue": 0, "sat": 0}
+
+    def set(self, value_id, *values):
+        if value_id == ID_BRIGHTNESS:
+            self.backlight.set_brightness(values[0] / 255)
+
+    def alert(self, hue, sat, brightness):
+        self.set(ID_BRIGHTNESS, brightness)
+
+    def restore(self, s):
+        self.set(ID_BRIGHTNESS, s["brightness"])
 
 
 class HapticMouse:
@@ -582,7 +819,7 @@ class HapticMouse:
     @classmethod
     def open(cls, hid_module=None):
         hid_module = hid_module or load_hid()
-        for info in haptic_interfaces(hid_module):
+        for info in hidpp_interfaces(hid_module):
             mouse = cls.probe(hid_module, info)
             if mouse:
                 return mouse
@@ -595,23 +832,7 @@ class HapticMouse:
             pass
 
     def request(self, feature, function, *params):
-        call = function << 4 | HIDPP_SWID
-        report = bytes([HIDPP_LONG, self.number, feature, call, *params]).ljust(HIDPP_LONG_SIZE, b"\x00")
-        if self.dev.write(report) < 0:
-            raise KeyboardError("write failed")
-        deadline = time.monotonic() + HIDPP_TIMEOUT_MS / 1000
-        while True:
-            remaining = int((deadline - time.monotonic()) * 1000)
-            reply = self.dev.read(32, remaining) if remaining > 0 else None
-            if not reply:
-                raise KeyboardError("mouse did not answer")
-            r = bytes(reply).ljust(HIDPP_LONG_SIZE, b"\x00")
-            if r[0] not in (HIDPP_LONG, HIDPP_SHORT) or r[1] not in (self.number, self.number ^ 0xFF):
-                continue
-            if r[2:4] == bytes([feature, call]):
-                return r[4:]
-            if r[2] in HIDPP_ERRORS and r[3:5] == bytes([feature, call]):
-                raise KeyboardError(f"HID++ error {r[5]:#04x}")
+        return hidpp_exchange(self, feature, function, *params)
 
     def find_haptics(self):
         index = self.request(0, 0, HAPTIC_HIGH, HAPTIC_LOW)[0]
@@ -659,7 +880,7 @@ class Config:
         waveforms = hp.get("waveforms") if isinstance(hp.get("waveforms"), dict) else {}
         agents = raw.get("agents")
         self.vid, self.pid = usb_id(kb.get("vid")), usb_id(kb.get("pid"))
-        self.lighting = kb.get("lighting") if kb.get("lighting") in LIGHTING else "auto"
+        self.lighting = kb.get("lighting") if kb.get("lighting") in (*LIGHTING, MACBOOK) else "auto"
         self.agents = tuple(a for a in agents if isinstance(a, str)) if isinstance(agents, list) else AGENTS
         self.blink = num(raw.get("blink_seconds"), 0.4, 0.1, 5)
         self.brightness = int(num(raw.get("brightness"), 255, 1, 255))
@@ -682,7 +903,7 @@ class Config:
         return self.haptic_done if kind == DONE else self.haptic_waveforms.get(agent, FALLBACK_WAVEFORM)
 
     def describe_keyboard(self):
-        which = f"{self.vid:04x}:{self.pid:04x}" if self.vid or self.pid else "first VIA keyboard found"
+        which = f"{self.vid:04x}:{self.pid:04x}" if self.vid or self.pid else "first usable keyboard found"
         return f"{which}, lighting {self.lighting}"
 
 
@@ -691,7 +912,24 @@ def load_config(root):
 
 
 def open_configured(config):
-    return Keyboard.open(None, config.vid, config.pid, config.lighting)
+    if config.lighting == MACBOOK:
+        return MacKeyboard.open()
+    hid_module = load_hid()
+    try:
+        kb = Keyboard.open(hid_module, config.vid, config.pid, config.lighting)
+        via_error = None
+    except KeyboardError as e:
+        kb, via_error = None, e
+    if kb is None and config.lighting == "auto":
+        try:
+            kb = LogiKeyboard.open(hid_module, config.vid, config.pid)
+        except KeyboardError as e:
+            via_error = KeyboardError(f"{via_error}; {e}") if via_error else e
+    if kb is None and config.lighting == "auto" and not config.vid and not config.pid:
+        kb = MacKeyboard.open()
+    if kb is None and via_error:
+        raise via_error
+    return kb
 
 
 class Daemon:
@@ -1109,24 +1347,32 @@ def cmd_devices(_args, hid_module=None):
         state = "on" if cfg.haptics_enabled else 'off, set "haptics": {"enabled": true} in config.json to use it'
         print(f"Haptic mouse:\n    {mouse.id}  {mouse.name}: ready (haptics {state})\n")
         mouse.close()
-    found = via_interfaces(hid_module)
-    if not found:
+    found = [(Keyboard, info) for info in via_interfaces(hid_module)] if cfg.lighting != MACBOOK else []
+    if cfg.lighting == "auto":
+        found += [(LogiKeyboard, info) for info in hidpp_interfaces(hid_module)]
+    mac = MacKeyboard.open() if cfg.lighting in ("auto", MACBOOK) else None
+    if not found and not mac:
         print("No VIA keyboard found. Connect it with a USB cable (wireless modes usually do not expose VIA)")
         print("and make sure it runs VIA-enabled QMK firmware.")
+        print("No Logitech keyboard found either. Turn it on and connect it by Bluetooth or a Bolt receiver.")
         return 1
     chosen, cannot_open = None, False
-    print("VIA keyboards:")
-    for info in found:
+    print("Keyboards:")
+    for driver, info in found:
         pinned = (not cfg.vid or info.get("vendor_id") == cfg.vid) and (not cfg.pid or info.get("product_id") == cfg.pid)
-        kb, reason = Keyboard.probe(hid_module, info, cfg.lighting)
+        kb, reason = driver.probe(hid_module, info, cfg.lighting)
         if kb:
             use = pinned and chosen is None
             chosen = chosen or (kb.id if use else None)
-            print(f"  {'*' if use else ' '} {kb.id}  {kb.name}: ready (VIA protocol {kb.protocol}, {kb.lighting})")
+            print(f"  {'*' if use else ' '} {kb.id}  {kb.name}: ready ({kb.details})")
             kb.close()
         else:
             cannot_open = cannot_open or reason.startswith("cannot open")
             print(f"    {device_id(info)}  {device_name(info)}: {reason}")
+    if mac:
+        use = chosen is None and not cfg.vid and not cfg.pid
+        chosen = mac.id if use else chosen
+        print(f"  {'*' if use else ' '} {mac.id}  {mac.name}: ready ({mac.details})")
     if chosen:
         print(f"\nagent-glow uses {chosen} (marked *).")
     elif cfg.vid or cfg.pid:
@@ -1139,7 +1385,7 @@ def cmd_devices(_args, hid_module=None):
 
 
 def udev_rule(ids):
-    lines = ["# agent-glow: let the logged-in user drive these keyboards' lighting over VIA raw HID"]
+    lines = ["# agent-glow: let the logged-in user drive these keyboards' lighting over raw HID"]
     for vid, pid in ids:
         lines.append(f'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{vid:04x}", '
                      f'ATTRS{{idProduct}}=="{pid:04x}", MODE="0660", TAG+="uaccess"')
@@ -1161,7 +1407,7 @@ def cmd_udev_rule(args, hid_module=None):
     if not ids:
         try:
             hid_module = hid_module or load_hid()
-            for info in via_interfaces(hid_module) + haptic_interfaces(hid_module):
+            for info in via_interfaces(hid_module) + hidpp_interfaces(hid_module):
                 pair = (info.get("vendor_id") or 0, info.get("product_id") or 0)
                 if pair not in ids:
                     ids.append(pair)
