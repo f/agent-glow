@@ -15,7 +15,8 @@ your own lighting back exactly as it was.
 If several agents are waiting, each flash shows the next one's color. Colors, speed and brightness are
 configurable, and an optional short "turn finished" flash is available.
 
-Built for Omnitype keyboards. It works with any QMK keyboard that has VIA and RGB lighting.
+Built for Omnitype keyboards. It works with any QMK keyboard that has VIA and RGB lighting, and with
+Logitech MX Keys keyboards (white backlight only, see [Logitech MX Keys](#logitech-mx-keys)).
 
 ## Requirements
 
@@ -90,10 +91,30 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 Then unplug and replug the keyboard. The rule covers your keyboard's VID:PID only and uses
 `TAG+="uaccess"`, so it grants access to the logged-in user.
 
+### Logitech MX Keys
+
+MX Keys keyboards connected by Bluetooth or a Bolt/Unifying receiver are driven over Logitech's HID++
+protocol (feature `0x1982`). Tested on an MX Keys Mac (`046d:b361`) over Bluetooth on macOS. No firmware
+or VIA setup is needed, but they differ from RGB keyboards:
+
+- **The backlight is white only.** Every agent blinks the same way, and the color settings are ignored.
+- **It only blinks while the backlight is lit.** If the backlight has gone dark, whether from idling or the
+  brightness keys, agent-glow cannot turn it back on, so the alert is not visible.
+- **Blinking may write to the keyboard's flash.** Logitech's backlight command is reported to save its
+  settings, so long alerts could add wear. Lower `needs_input.ttl_seconds` to limit how long they run.
+- **Some models only switch on and off.** On these, including the MX Keys Mac, `brightness` has no effect.
+- **Short pauses can happen.** The keyboard sometimes stops answering over Bluetooth. agent-glow
+  reconnects by itself after a few seconds.
+- **Lighting changes are not guaranteed to be temporary.** agent-glow reads your backlight mode and level
+  before an alert and writes them back afterwards. If a crash interrupts this, the next daemon start or
+  `agent-glow restore` puts them back.
+- **A VIA keyboard takes priority** when both are connected. Pin one with `keyboard.vid` and `keyboard.pid`.
+- **Logi Options+ may also change the backlight** while it is running.
+
 ## Commands
 
 ```
-agent-glow devices                  list VIA keyboards and whether agent-glow can drive them
+agent-glow devices                  list VIA and Logitech keyboards and whether agent-glow can drive them
 agent-glow test [AGENT|all|done] [SECONDS]
 agent-glow status                   daemon, keyboard and pending alerts
 agent-glow stop                     stop the daemon (the lighting is put back)
@@ -126,8 +147,8 @@ Create `~/.agent-glow/config.json`. Every key is optional, and the daemon picks 
 
 | Key | Meaning |
 | --- | --- |
-| `keyboard.vid` / `pid` | Which keyboard to use, as hex strings. Without them, the first usable VIA keyboard is used. |
-| `keyboard.lighting` | `auto`, `rgblight` or `rgb_matrix`. Set it if the keyboard has both and `auto` picks the wrong one. |
+| `keyboard.vid` / `pid` | Which keyboard to use, as hex strings. Without them, the first usable keyboard is used (VIA first, then Logitech). |
+| `keyboard.lighting` | `auto`, `rgblight` or `rgb_matrix`. Set it if the keyboard has both and `auto` picks the wrong one. Logitech keyboards are only used with `auto`. |
 | `agents` | Agents that may blink the keyboard. |
 | `blink_seconds` | Time on and time off per blink, from 0.1 to 5. |
 | `brightness` | Alert brightness, from 1 to 255. |
@@ -138,7 +159,7 @@ Create `~/.agent-glow/config.json`. Every key is optional, and the daemon picks 
 ## How it works
 
 ```
-agent hook ──► ~/.agent-glow/sessions/*.json ──► daemon ──VIA raw HID──► keyboard
+agent hook ──► ~/.agent-glow/sessions/*.json ──► daemon ──VIA or HID++ raw HID──► keyboard
 ```
 
 - **Hooks never touch the keyboard.** A hook only writes or deletes a tiny marker file and always
@@ -154,7 +175,7 @@ agent hook ──► ~/.agent-glow/sessions/*.json ──► daemon ──VIA ra
   - Saves the keyboard's current effect, color, brightness and speed.
   - Blinks the alert color.
   - Restores your lighting when nothing is waiting any more.
-- **Your saved lighting is never overwritten.** Every write uses VIA's non-saving "set" command, so
+- **Your saved lighting is never overwritten (QMK).** Every write uses VIA's non-saving "set" command, so
   the keyboard's EEPROM is untouched, and unplugging it always brings your own lighting back.
 - **Crash recovery.** If the daemon dies mid-alert, the saved snapshot is restored the next time it
   starts, or when you run `agent-glow restore`.

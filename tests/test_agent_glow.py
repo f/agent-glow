@@ -866,7 +866,7 @@ class ConfigValues(unittest.TestCase):
         self.assertEqual(c.describe_keyboard(), "4d4c:6505, lighting rgb_matrix")
         c = ag.Config({"keyboard": {"vid": "nope", "pid": True, "lighting": "lasers"}})
         self.assertEqual((c.vid, c.pid, c.lighting), (0, 0, "auto"))
-        self.assertEqual(c.describe_keyboard(), "first VIA keyboard found, lighting auto")
+        self.assertEqual(c.describe_keyboard(), "first usable keyboard found, lighting auto")
 
     def test_usb_ids(self):
         self.assertEqual([ag.usb_id(v) for v in ("4d4c", "0x4D4C", " 4d4c ", 19788, 70000, -1, None, 1.5, True)],
@@ -1261,6 +1261,206 @@ class HookCommand(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn(b"daemon    : not running", r.stdout)
         self.assertEqual(self.run_hook(["bogus"], b"", home).returncode, 2)
+
+
+class FakeLogi:
+    INDEX = 7
+
+    def __init__(self, options=0x08, level=0, enabled=1, supported=0x38, version=4, levels=8, feature=True,
+                 number=0xFF, reply_number=None):
+        self.config = dict(enabled=enabled, options=options, level=level)
+        self.supported, self.version, self.levels, self.feature = supported, version, levels, feature
+        self.number = number
+        self.reply_number = number if reply_number is None else reply_number
+        self.durations = (11, 11, 60, 42)
+        self.requests = 0
+        self.drop = 0
+        self.writes = []
+        self.reply = None
+        self.alive = True
+        self.closed = False
+        self.refuse_open = None
+
+    def write(self, data):
+        if not self.alive:
+            raise OSError("unplugged")
+        assert data[0] == 0x11 and len(data) == 20
+        self.requests += 1
+        if self.drop:
+            self.drop -= 1
+            self.reply, self.pending = None, None
+            return len(data)
+        self.reply = [0x10, 0, 0, 0, 0, 0, 0]
+        number, index, call, params = data[1], data[2], data[3], data[4:]
+        head = [0x11, self.reply_number, index, call]
+        if number != self.number:
+            self.pending = [0x10, number, 0x8F, index, call, 0x01, 0]
+            return len(data)
+        if index == 0:
+            assert bytes(params[:2]) == b"\x19\x82"
+            self.pending = head + [self.INDEX if self.feature else 0, 0, self.version]
+        elif call >> 4 == ag.BACKLIGHT_GET:
+            c = self.config
+            self.pending = head + list(ag.struct.pack(
+                "<BBBHBHHHH", c["enabled"], c["options"], self.supported, 0, c["level"], *self.durations))
+        elif call >> 4 == ag.BACKLIGHT_SET:
+            enabled, options, effect, level, *durations = ag.struct.unpack("<BBBBHHHH", bytes(params[:12]))
+            assert effect == 0xFF and tuple(durations) == self.durations
+            self.config = dict(enabled=enabled, options=options, level=level)
+            self.writes.append((enabled, options, level))
+            self.pending = head
+        elif call >> 4 == ag.BACKLIGHT_RANGE:
+            self.pending = head + [self.levels]
+        else:
+            self.pending = [0x11, self.number, 0xFF, index, call, 0x05]
+        return len(data)
+
+    def read(self, size, timeout):
+        if not self.alive:
+            raise OSError("unplugged")
+        reply, self.reply = self.reply, None
+        if reply:
+            return reply
+        reply, self.pending = self.pending, None
+        return reply or []
+
+
+def add_logi(hid, logi, page=0xFF43, usage=0x0202, pid=0xB35B, product="MX Keys"):
+    n = len(hid.keyboards)
+    info = {"vendor_id": 0x046D, "product_id": pid, "manufacturer_string": "Logitech", "product_string": product,
+            "path": b"logi%d" % n, "usage_page": page, "usage": usage}
+    hid.keyboards.append((info, logi))
+    return logi
+
+
+class LogitechKeyboard(unittest.TestCase):
+    def open(self, logi, **kwargs):
+        hid = FakeHid()
+        add_logi(hid, logi, **kwargs)
+        return ag.LogiKeyboard.open(hid)
+
+    def test_bluetooth_keyboard_is_found_and_reports_its_state(self):
+        kb = self.open(FakeLogi(options=0x18, level=5))
+        self.assertEqual((kb.id, kb.name, kb.lighting), ("046d:b35b", "Logitech MX Keys", "backlight"))
+        self.assertEqual(kb.read_state(), {"effect": 0x18, "brightness": 5, "speed": 1, "hue": 0, "sat": 0})
+
+    def test_a_bluetooth_reply_may_use_device_number_zero(self):
+        self.assertIsNotNone(self.open(FakeLogi(reply_number=0)))
+
+    def test_receiver_slots_are_searched(self):
+        kb = self.open(FakeLogi(number=3), page=0xFF00, usage=0x0002, pid=0xC548)
+        self.assertEqual(kb.number, 3)
+
+    def test_receiver_short_interface_is_skipped(self):
+        self.assertIsNone(self.open(FakeLogi(number=1), page=0xFF00, usage=0x0001))
+
+    def test_device_without_backlight_is_reported(self):
+        with self.assertRaises(ag.KeyboardError) as caught:
+            self.open(FakeLogi(feature=False))
+        self.assertIn("no HID++ backlight", str(caught.exception))
+
+    def test_a_pinned_other_vendor_skips_logitech(self):
+        hid = FakeHid()
+        add_logi(hid, FakeLogi())
+        self.assertIsNone(ag.LogiKeyboard.open(hid, vid=0x4D4C))
+
+    def test_blink_uses_manual_mode_and_restore_puts_automatic_back(self):
+        logi = FakeLogi(options=0x08)
+        kb = self.open(logi)
+        before = kb.read_state()
+        kb.alert(0, 255, 255)
+        kb.set(ag.ID_COLOR, 170, 255)
+        kb.set(ag.ID_BRIGHTNESS, 0)
+        kb.set(ag.ID_BRIGHTNESS, 255)
+        self.assertEqual(logi.writes, [(1, 0x18, 7), (0, 0x18, 7), (1, 0x18, 7)])
+        kb.restore(before)
+        self.assertEqual(logi.writes[-1], (1, 0x08, 0))
+        self.assertTrue(ag.same_lighting(kb.read_state(), before))
+
+    def test_older_firmware_toggles_the_backlight_without_changing_mode(self):
+        logi = FakeLogi(options=0x08, supported=0, version=1)
+        kb = self.open(logi)
+        kb.alert(0, 255, 255)
+        kb.set(ag.ID_BRIGHTNESS, 0)
+        self.assertEqual(logi.writes, [(1, 0x08, 0), (0, 0x08, 0)])
+
+    def test_device_errors_raise_without_a_retry(self):
+        logi = FakeLogi()
+        kb = self.open(logi)
+        logi.requests = 0
+        with self.assertRaises(ag.KeyboardError):
+            kb.request(kb.feature, 9)
+        self.assertEqual(logi.requests, 1)
+
+    def test_a_timed_out_request_is_retried_once(self):
+        logi = FakeLogi(options=0x08)
+        kb = self.open(logi)
+        logi.drop, logi.requests = 1, 0
+        kb.set(ag.ID_BRIGHTNESS, 0)
+        self.assertEqual((logi.requests, logi.writes), (2, [(0, 0x08, 0)]))
+        logi.drop, logi.requests = 2, 0
+        with self.assertRaises(ag.HidppTimeout):
+            kb.set(ag.ID_BRIGHTNESS, 255)
+        self.assertEqual(logi.requests, 2)
+
+    def test_daemon_blinks_and_restores(self):
+        logi = FakeLogi(options=0x08)
+        hid = FakeHid()
+        add_logi(hid, logi)
+        now = [100.0]
+        root = temp_dir(self)
+        store = ag.Store(root)
+        with mock.patch.object(ag, "load_hid", lambda: hid):
+            daemon = REAL_DAEMON(store, mono=lambda: now[0], logger=lambda _msg: None)
+            store.put("claude", "s", ag.MAIN, ag.NEEDS_INPUT)
+            daemon.tick()
+            self.assertEqual(logi.config, dict(enabled=1, options=0x18, level=7))
+            now[0] += 1
+            daemon.tick()
+            self.assertEqual(logi.config["enabled"], 0)
+            store.drop("claude", "s")
+            daemon.tick()
+        self.assertEqual(logi.config, dict(enabled=1, options=0x08, level=0))
+        self.assertFalse(store.has_snapshot())
+
+    def test_via_keyboard_wins_and_a_broken_one_falls_back_to_logitech(self):
+        hid = FakeHid(FakeVia())
+        add_logi(hid, FakeLogi())
+        with mock.patch.object(ag, "load_hid", lambda: hid):
+            self.assertEqual(ag.open_configured(ag.Config()).lighting, "rgblight")
+            self.assertEqual(ag.open_configured(ag.Config({"keyboard": {"vid": "046d"}})).lighting, "backlight")
+        broken = FakeHid(FakeVia(protocol=9))
+        add_logi(broken, FakeLogi())
+        with mock.patch.object(ag, "load_hid", lambda: broken):
+            self.assertEqual(ag.open_configured(ag.Config()).lighting, "backlight")
+
+    def test_pinned_lighting_mode_leaves_logitech_alone(self):
+        hid = FakeHid()
+        add_logi(hid, FakeLogi())
+        with mock.patch.object(ag, "load_hid", lambda: hid):
+            self.assertIsNone(ag.open_configured(ag.Config({"keyboard": {"lighting": "rgblight"}})))
+
+    def test_macos_opens_the_interface_shared_then_restores_the_default(self):
+        hid = FakeHid()
+        add_logi(hid, FakeLogi())
+        with mock.patch.object(ag.sys, "platform", "darwin"), mock.patch("ctypes.CDLL") as cdll:
+            hid.__file__ = "hid.so"
+            self.assertIsNotNone(ag.LogiKeyboard.open(hid))
+        calls = cdll.return_value.hid_darwin_set_open_exclusive.call_args_list
+        self.assertEqual([c.args for c in calls], [(0,), (1,)])
+
+    def test_devices_and_udev_rule_include_logitech(self):
+        hid = FakeHid()
+        add_logi(hid, FakeLogi())
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENT_GLOW_HOME": temp_dir(self)}), contextlib.redirect_stdout(out):
+            self.assertEqual(ag.cmd_devices([], hid_module=hid), 0)
+        self.assertIn("046d:b35b  Logitech MX Keys: ready (HID++ backlight v4, white only)", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ag.cmd_udev_rule([], hid_module=hid), 0)
+        self.assertIn('ATTRS{idVendor}=="046d", ATTRS{idProduct}=="b35b"', out.getvalue())
+        self.assertIn('KERNELS=="0005:046D:*"', out.getvalue())
 
 
 if __name__ == "__main__":
