@@ -43,6 +43,21 @@ READ_TIMEOUT_MS = 500
 # rgb_matrix scales brightness by RGB_MATRIX_MAXIMUM_BRIGHTNESS, so it does not read back exactly.
 BRIGHTNESS_SLACK = 2
 
+LOGITECH_VID = 0x046D
+HIDPP_LONG, HIDPP_SHORT, HIDPP_LONG_SIZE = 0x11, 0x10, 20
+HIDPP_ERRORS = (0xFF, 0x8F)
+HIDPP_BLE_PAGE, HIDPP_RECEIVER_PAGE, HIDPP_RECEIVER_USAGE = 0xFF43, 0xFF00, 0x0002
+HIDPP_DIRECT, HIDPP_RECEIVER_SLOTS = 0xFF, range(1, 7)
+HIDPP_SWID, HIDPP_TIMEOUT_MS = 0x0A, 1500
+HAPTIC_HIGH, HAPTIC_LOW = 0x19, 0xB0
+HAPTIC_CAPABILITIES, HAPTIC_CONFIGURATION, HAPTIC_PLAY = 0, 1, 4
+HAPTIC_GAP = 1.5
+WAVEFORMS = {"sharp_state_change": 0x00, "damp_state_change": 0x01, "sharp_collision": 0x02, "damp_collision": 0x03,
+             "subtle_collision": 0x04, "happy_alert": 0x05, "angry_alert": 0x06, "completed": 0x07, "square": 0x08,
+             "wave": 0x09, "firework": 0x0A, "mad": 0x0B, "knock": 0x0C, "jingle": 0x0D, "ringing": 0x0E}
+AGENT_WAVEFORMS = {"claude": "happy_alert", "codex": "angry_alert", "copilot": "ringing"}
+FALLBACK_WAVEFORM, DONE_WAVEFORM = "happy_alert", "completed"
+
 NEEDS_INPUT, DONE = "needs_input", "done"
 AGENTS = ("claude", "codex", "copilot")
 AGENT_COLORS = {"claude": (0, 255), "codex": (170, 255), "copilot": (85, 255)}  # (hue, sat): red, blue, green
@@ -511,6 +526,108 @@ class Keyboard:
         self.set(ID_SPEED, s["speed"])
 
 
+def haptic_interfaces(hid_module, vid=LOGITECH_VID, pid=0):
+    return [info for info in hid_module.enumerate(vid, pid)
+            if info.get("usage_page") == HIDPP_BLE_PAGE
+            or (info.get("usage_page") == HIDPP_RECEIVER_PAGE and info.get("usage") == HIDPP_RECEIVER_USAGE)]
+
+
+def set_open_exclusive(hid_module, exclusive):
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(hid_module.__file__).hid_darwin_set_open_exclusive(int(exclusive))
+    except (AttributeError, ImportError, OSError, TypeError):
+        pass
+
+
+class HapticMouse:
+    def __init__(self, dev, info=None, number=HIDPP_DIRECT):
+        self.dev = dev
+        self.info = info or {}
+        self.number = number
+        self.feature, self.waveforms = 0, 0
+
+    @property
+    def id(self):
+        return device_id(self.info)
+
+    @property
+    def name(self):
+        return device_name(self.info)
+
+    @classmethod
+    def probe(cls, hid_module, info):
+        dev = hid_module.device()
+        set_open_exclusive(hid_module, False)
+        try:
+            dev.open_path(info["path"])
+        except (OSError, ValueError, KeyError):
+            return None
+        finally:
+            set_open_exclusive(hid_module, True)
+        mouse = cls(dev, info)
+        slots = (HIDPP_DIRECT,) if info.get("usage_page") == HIDPP_BLE_PAGE else HIDPP_RECEIVER_SLOTS
+        for number in slots:
+            mouse.number = number
+            try:
+                if mouse.find_haptics():
+                    return mouse
+            except OSError:
+                pass
+        mouse.close()
+        return None
+
+    @classmethod
+    def open(cls, hid_module=None):
+        hid_module = hid_module or load_hid()
+        for info in haptic_interfaces(hid_module):
+            mouse = cls.probe(hid_module, info)
+            if mouse:
+                return mouse
+        return None
+
+    def close(self):
+        try:
+            self.dev.close()
+        except OSError:
+            pass
+
+    def request(self, feature, function, *params):
+        call = function << 4 | HIDPP_SWID
+        report = bytes([HIDPP_LONG, self.number, feature, call, *params]).ljust(HIDPP_LONG_SIZE, b"\x00")
+        if self.dev.write(report) < 0:
+            raise KeyboardError("write failed")
+        deadline = time.monotonic() + HIDPP_TIMEOUT_MS / 1000
+        while True:
+            remaining = int((deadline - time.monotonic()) * 1000)
+            reply = self.dev.read(32, remaining) if remaining > 0 else None
+            if not reply:
+                raise KeyboardError("mouse did not answer")
+            r = bytes(reply).ljust(HIDPP_LONG_SIZE, b"\x00")
+            if r[0] not in (HIDPP_LONG, HIDPP_SHORT) or r[1] not in (self.number, self.number ^ 0xFF):
+                continue
+            if r[2:4] == bytes([feature, call]):
+                return r[4:]
+            if r[2] in HIDPP_ERRORS and r[3:5] == bytes([feature, call]):
+                raise KeyboardError(f"HID++ error {r[5]:#04x}")
+
+    def find_haptics(self):
+        index = self.request(0, 0, HAPTIC_HIGH, HAPTIC_LOW)[0]
+        if not index or not self.request(index, HAPTIC_CONFIGURATION)[0] & 0x01:
+            return False
+        self.feature = index
+        self.waveforms = int.from_bytes(self.request(index, HAPTIC_CAPABILITIES)[4:8], "big")
+        return True
+
+    def supports(self, name):
+        return bool(self.waveforms >> WAVEFORMS[name] & 1)
+
+    def play(self, name):
+        self.request(self.feature, HAPTIC_PLAY, WAVEFORMS[name])
+
+
 def same_lighting(live, wanted):
     return (all(live[k] == wanted[k] for k in ("effect", "speed", "hue", "sat"))
             and abs(live["brightness"] - wanted["brightness"]) <= BRIGHTNESS_SLACK)
@@ -520,6 +637,10 @@ def same_lighting(live, wanted):
 
 def agent_order(name):
     return (AGENTS.index(name) if name in AGENTS else len(AGENTS), name)
+
+
+def waveform(raw, default):
+    return raw if isinstance(raw, str) and raw in WAVEFORMS else default
 
 
 def hue_sat(raw, default):
@@ -534,6 +655,8 @@ class Config:
         ni = raw.get("needs_input") if isinstance(raw.get("needs_input"), dict) else {}
         dn = raw.get("done") if isinstance(raw.get("done"), dict) else {}
         colors = ni.get("colors") if isinstance(ni.get("colors"), dict) else {}
+        hp = raw.get("haptics") if isinstance(raw.get("haptics"), dict) else {}
+        waveforms = hp.get("waveforms") if isinstance(hp.get("waveforms"), dict) else {}
         agents = raw.get("agents")
         self.vid, self.pid = usb_id(kb.get("vid")), usb_id(kb.get("pid"))
         self.lighting = kb.get("lighting") if kb.get("lighting") in LIGHTING else "auto"
@@ -546,9 +669,17 @@ class Config:
         self.done_enabled = bool(dn.get("enabled", False))
         self.done_color = hue_sat(dn, (85, 255))
         self.done_seconds = num(dn.get("seconds"), 5, 1, 300)
+        self.haptics_enabled = hp.get("enabled") is True
+        self.haptic_repeat = num(hp.get("repeat_seconds"), 30, 0, 3600)
+        self.haptic_waveforms = {name: waveform(waveforms.get(name), AGENT_WAVEFORMS.get(name, FALLBACK_WAVEFORM))
+                                 for name in {*AGENT_WAVEFORMS, *waveforms}}
+        self.haptic_done = waveform(waveforms.get("done"), DONE_WAVEFORM)
 
     def needs_input_color(self, agent):
         return self.colors.get(agent, FALLBACK_COLOR)
+
+    def waveform_for(self, kind, agent):
+        return self.haptic_done if kind == DONE else self.haptic_waveforms.get(agent, FALLBACK_WAVEFORM)
 
     def describe_keyboard(self):
         which = f"{self.vid:04x}:{self.pid:04x}" if self.vid or self.pid else "first VIA keyboard found"
@@ -565,9 +696,15 @@ def open_configured(config):
 
 class Daemon:
     def __init__(self, store, open_keyboard=open_configured, wall=time.time, mono=time.monotonic,
-                 logger=log):
+                 logger=log, open_mouse=HapticMouse.open):
         self.store = store
         self.open_keyboard = open_keyboard
+        self.open_mouse = open_mouse
+        self.mouse = None
+        self.mouse_retry_at = 0.0
+        self.mouse_logged = False
+        self.buzzed = {}
+        self.buzz_at = None
         self.wall, self.mono, self.log = wall, mono, logger
         self.config_path = os.path.join(store.root, "config.json")
         self.config_mtime, self.config = None, Config()
@@ -655,6 +792,62 @@ class Daemon:
         self.retry_at = self.mono() + RETRY_SECONDS
         self.alert = None  # re-apply the alert lighting after reconnecting
 
+    def haptic_mouse(self):
+        if self.mouse:
+            return self.mouse
+        now = self.mono()
+        if now < self.mouse_retry_at:
+            return None
+        try:
+            self.mouse = self.open_mouse()
+        except (OSError, ImportError) as e:
+            self.mouse = None
+            if not self.mouse_logged:
+                self.log(f"cannot use the haptic mouse: {e}")
+        if self.mouse is None:
+            self.mouse_retry_at = now + RETRY_SECONDS
+            if not self.mouse_logged:
+                self.log("haptic mouse not available, will keep retrying")
+                self.mouse_logged = True
+            return None
+        self.mouse_logged = False
+        self.log(f"haptic mouse connected: {self.mouse.id} {self.mouse.name}")
+        return self.mouse
+
+    def close_mouse(self):
+        if self.mouse:
+            self.mouse.close()
+        self.mouse = None
+
+    def haptics(self, want):
+        cfg = self.config
+        if want is None or not cfg.haptics_enabled:
+            self.buzzed = {}
+            self.close_mouse()
+            return
+        kind, agents, _colors = want
+        keys = [(kind, agent) for agent in agents]
+        self.buzzed = {key: at for key, at in self.buzzed.items() if key in keys}
+        now = self.mono()
+        due = [key for key in keys if key not in self.buzzed or (
+            kind == NEEDS_INPUT and cfg.haptic_repeat and now - self.buzzed[key] >= cfg.haptic_repeat)]
+        if not due or (self.buzz_at is not None and now - self.buzz_at < HAPTIC_GAP):
+            return
+        mouse = self.haptic_mouse()
+        if mouse is None:
+            return
+        name = cfg.waveform_for(*due[0])
+        try:
+            if mouse.supports(name):
+                mouse.play(name)
+                self.buzz_at = now
+        except OSError as e:
+            self.log(f"haptic mouse error: {e}")
+            self.close_mouse()
+            self.mouse_retry_at = now + RETRY_SECONDS
+            return
+        self.buzzed[due[0]] = now
+
     def describe(self):
         a = self.alert
         self.log(f"alert {a['kind']} ({', '.join(safe(name, 20) for name in a['agents'])})")
@@ -727,6 +920,7 @@ class Daemon:
         """One poll step; returns how long to sleep before the next one."""
         self.load_config()
         want = self.desired()
+        self.haptics(want)
         if want is None:
             if self.alert is not None or self.store.has_snapshot():
                 self.finish()
@@ -749,6 +943,7 @@ class Daemon:
         if self.alert is not None or self.store.has_snapshot():
             self.finish()
         self.close_keyboard()
+        self.close_mouse()
 
 
 # ---------------------------------------------------------------- single instance
@@ -890,6 +1085,7 @@ def cmd_status(_args):
     print("daemon    : " + (f"running (pid {pid})" if pid else "not running"))
     print(f"keyboard  : {cfg.describe_keyboard()}  (run `agent-glow devices` to check it)")
     print("agents    : " + (", ".join(a for a in AGENTS if a in cfg.agents) or "none"))
+    print("haptics   : " + ("on" if cfg.haptics_enabled else "off"))
     print("snapshot  : " + ("saved, lighting not restored yet" if store.has_snapshot() else "none"))
     markers, now = store.markers(), time.time()
     print(f"markers   : {len(markers)}")
@@ -908,6 +1104,11 @@ def cmd_devices(_args, hid_module=None):
         print(f"hidapi is not available ({e}); run install.py, or `pip install hidapi`")
         return 1
     cfg = load_config(state_root())
+    mouse = HapticMouse.open(hid_module)
+    if mouse:
+        state = "on" if cfg.haptics_enabled else 'off, set "haptics": {"enabled": true} in config.json to use it'
+        print(f"Haptic mouse:\n    {mouse.id}  {mouse.name}: ready (haptics {state})\n")
+        mouse.close()
     found = via_interfaces(hid_module)
     if not found:
         print("No VIA keyboard found. Connect it with a USB cable (wireless modes usually do not expose VIA)")
@@ -942,6 +1143,9 @@ def udev_rule(ids):
     for vid, pid in ids:
         lines.append(f'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{vid:04x}", '
                      f'ATTRS{{idProduct}}=="{pid:04x}", MODE="0660", TAG+="uaccess"')
+    if any(vid == LOGITECH_VID for vid, _pid in ids):
+        lines.append(f'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:{LOGITECH_VID:04X}:*", '
+                     'MODE="0660", TAG+="uaccess"')
     return "\n".join(lines) + "\n"
 
 
@@ -957,7 +1161,7 @@ def cmd_udev_rule(args, hid_module=None):
     if not ids:
         try:
             hid_module = hid_module or load_hid()
-            for info in via_interfaces(hid_module):
+            for info in via_interfaces(hid_module) + haptic_interfaces(hid_module):
                 pair = (info.get("vendor_id") or 0, info.get("product_id") or 0)
                 if pair not in ids:
                     ids.append(pair)

@@ -15,7 +15,8 @@ your own lighting back exactly as it was.
 If several agents are waiting, each flash shows the next one's color. Colors, speed and brightness are
 configurable, and an optional short "turn finished" flash is available.
 
-Built for Omnitype keyboards. It works with any QMK keyboard that has VIA and RGB lighting.
+Built for Omnitype keyboards. It works with any QMK keyboard that has VIA and RGB lighting. A Logitech
+MX Master 4 can also vibrate when an agent is waiting, see [Mouse vibration](#mouse-vibration).
 
 ## Requirements
 
@@ -90,6 +91,28 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 Then unplug and replug the keyboard. The rule covers your keyboard's VID:PID only and uses
 `TAG+="uaccess"`, so it grants access to the logged-in user.
 
+### Mouse vibration
+
+A Logitech mouse with haptics, such as the MX Master 4, can vibrate when an agent is waiting, with or without
+a keyboard connected. It's off by default:
+
+```json
+{ "haptics": { "enabled": true } }
+```
+
+Each agent has its own vibration, so you can tell them apart by feel:
+
+| Agent waiting | Vibration |
+| --- | --- |
+| Claude Code | `happy_alert` |
+| Codex | `angry_alert` |
+| GitHub Copilot | `ringing` |
+
+It vibrates when an agent starts waiting, then again every `repeat_seconds` until you answer. Tested on an
+MX Master 4 (`046d:b042`) over Bluetooth on macOS. The haptic command is reverse-engineered, so a Logitech
+firmware update could change it. It doesn't change your mouse's settings, and the mouse must have haptics
+turned on in Logi Options+.
+
 ## Commands
 
 ```
@@ -120,7 +143,12 @@ Create `~/.agent-glow/config.json`. Every key is optional, and the daemon picks 
       "copilot": { "hue": 85,  "sat": 255 }
     }
   },
-  "done": { "enabled": false, "hue": 85, "sat": 255, "seconds": 5 }
+  "done": { "enabled": false, "hue": 85, "sat": 255, "seconds": 5 },
+  "haptics": {
+    "enabled": false,
+    "repeat_seconds": 30,
+    "waveforms": { "claude": "happy_alert", "codex": "angry_alert", "copilot": "ringing", "done": "completed" }
+  }
 }
 ```
 
@@ -134,6 +162,9 @@ Create `~/.agent-glow/config.json`. Every key is optional, and the daemon picks 
 | `needs_input.colors` | Color per agent, as QMK hue and saturation (0–255). Red is 0, yellow 43, green 85, cyan 128, blue 170, magenta 213. |
 | `needs_input.ttl_seconds` | Stop blinking for a question nobody answered after this long. |
 | `done` | Flash this color for `seconds` when an agent finishes its turn. Off by default. |
+| `haptics.enabled` | Vibrate a Logitech haptic mouse when an agent is waiting. Off by default. |
+| `haptics.repeat_seconds` | Vibrate again this often while an agent is waiting, from 0 (never) to 3600. |
+| `haptics.waveforms` | Vibration per agent, plus `done` for the optional "turn finished" alert. One of `sharp_state_change`, `damp_state_change`, `sharp_collision`, `damp_collision`, `subtle_collision`, `happy_alert`, `angry_alert`, `completed`, `square`, `wave`, `firework`, `mad`, `knock`, `jingle`, `ringing`. |
 
 ## How it works
 
@@ -195,7 +226,7 @@ stays until you delete it.
 python3 -m unittest discover -s tests
 ```
 
-The tests run without a keyboard. They use a fake VIA device that behaves like QMK's `via.c`.
+The tests run without a keyboard or mouse. They use a fake haptic mouse and a fake VIA device that behaves like QMK's `via.c`.
 
 ## License
 

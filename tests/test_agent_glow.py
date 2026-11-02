@@ -1263,5 +1263,253 @@ class HookCommand(unittest.TestCase):
         self.assertEqual(self.run_hook(["bogus"], b"", home).returncode, 2)
 
 
+class FakeHaptic:
+    INDEX = 11
+
+    def __init__(self, flags=0x03, mask=0x7FFF, feature=True, number=0xFF):
+        self.flags, self.mask, self.feature, self.number = flags, mask, feature, number
+        self.played = []
+        self.reply = None
+        self.pending = None
+        self.alive = True
+        self.closed = False
+        self.refuse_open = None
+
+    def write(self, data):
+        if not self.alive:
+            raise OSError("unplugged")
+        assert data[0] == 0x11 and len(data) == 20
+        self.reply = [0x10, 0, 0, 0, 0, 0, 0]
+        number, index, call, params = data[1], data[2], data[3], data[4:]
+        head = [0x11, self.number, index, call]
+        if number != self.number:
+            self.pending = [0x10, number, 0x8F, index, call, 0x01, 0]
+        elif index == 0:
+            assert bytes(params[:2]) == b"\x19\xb0"
+            self.pending = head + [self.INDEX if self.feature else 0, 0, 0]
+        elif call >> 4 == ag.HAPTIC_CAPABILITIES:
+            self.pending = head + [0, 1, 0, 0x3C] + list(self.mask.to_bytes(4, "big"))
+        elif call >> 4 == ag.HAPTIC_CONFIGURATION:
+            self.pending = head + [self.flags, 0x3C]
+        elif call >> 4 == ag.HAPTIC_PLAY:
+            self.played.append(params[0])
+            self.pending = head
+        else:
+            self.pending = [0x11, self.number, 0xFF, index, call, 0x07]
+        return len(data)
+
+    def read(self, size, timeout):
+        if not self.alive:
+            raise OSError("unplugged")
+        reply, self.reply = self.reply, None
+        if reply:
+            return reply
+        reply, self.pending = self.pending, None
+        return reply or []
+
+
+def add_mouse(hid, mouse, page=0xFF43, usage=0x0202, pid=0xB042):
+    info = {"vendor_id": 0x046D, "product_id": pid, "manufacturer_string": "Logitech", "product_string": "MX Master 4",
+            "path": b"mouse%d" % len(hid.keyboards), "usage_page": page, "usage": usage}
+    hid.keyboards.append((info, mouse))
+    return mouse
+
+
+class HapticDevice(unittest.TestCase):
+    def open(self, mouse, **kwargs):
+        hid = FakeHid()
+        add_mouse(hid, mouse, **kwargs)
+        return ag.HapticMouse.open(hid)
+
+    def test_bluetooth_mouse_is_found_and_plays(self):
+        fake = FakeHaptic()
+        mouse = self.open(fake)
+        self.assertEqual((mouse.id, mouse.name), ("046d:b042", "Logitech MX Master 4"))
+        mouse.play("angry_alert")
+        self.assertEqual(fake.played, [0x06])
+
+    def test_receiver_slots_are_searched(self):
+        self.assertEqual(self.open(FakeHaptic(number=2), page=0xFF00, usage=0x0002, pid=0xC548).number, 2)
+
+    def test_short_receiver_interface_and_other_devices_are_skipped(self):
+        self.assertIsNone(self.open(FakeHaptic(number=1), page=0xFF00, usage=0x0001))
+        self.assertIsNone(self.open(FakeHaptic(feature=False)))
+
+    def test_haptics_turned_off_on_the_mouse_are_left_alone(self):
+        self.assertIsNone(self.open(FakeHaptic(flags=0x02)))
+
+    def test_refused_open_is_skipped(self):
+        fake = FakeHaptic()
+        fake.refuse_open = "busy"
+        self.assertIsNone(self.open(fake))
+
+    def test_supported_waveforms_come_from_the_mask(self):
+        mouse = self.open(FakeHaptic(mask=1 << 0x05))
+        self.assertTrue(mouse.supports("happy_alert"))
+        self.assertFalse(mouse.supports("ringing"))
+
+    def test_device_errors_raise(self):
+        mouse = self.open(FakeHaptic())
+        with self.assertRaises(ag.KeyboardError):
+            mouse.request(mouse.feature, 9)
+
+    def test_interface_is_opened_shared_on_macos(self):
+        hid = FakeHid()
+        add_mouse(hid, FakeHaptic())
+        hid.__file__ = "hid.so"
+        with mock.patch.object(ag.sys, "platform", "darwin"), mock.patch("ctypes.CDLL") as cdll:
+            self.assertIsNotNone(ag.HapticMouse.open(hid))
+        calls = cdll.return_value.hid_darwin_set_open_exclusive.call_args_list
+        self.assertEqual([c.args for c in calls], [(0,), (1,)])
+
+
+class HapticAlerts(unittest.TestCase):
+    def setUp(self):
+        self.root = temp_dir(self)
+        self.store = ag.Store(self.root)
+        self.clock = Clock()
+        self.fake = FakeHaptic()
+        self.hid = FakeHid()
+        add_mouse(self.hid, self.fake)
+        self.opens = 0
+        self.logs = []
+        self.configure()
+
+    def configure(self, **haptics):
+        with open(os.path.join(self.root, "config.json"), "w") as f:
+            json.dump({"haptics": dict({"enabled": True}, **haptics)}, f)
+        self.d = ag.Daemon(self.store, lambda _cfg: None, wall=self.clock, mono=self.clock,
+                           logger=self.logs.append, open_mouse=self.open_mouse)
+
+    def open_mouse(self):
+        self.opens += 1
+        return ag.HapticMouse.open(self.hid)
+
+    def wait(self, agent="claude", state=ag.NEEDS_INPUT):
+        self.store.put(agent, "s", ag.MAIN, state, now=self.clock())
+
+    def advance(self, seconds):
+        self.clock.t += seconds
+        for marker in self.store.markers():
+            if marker[1]:
+                self.store.put(marker[1]["agent"], marker[1]["session"], marker[1]["agent_id"], marker[1]["state"],
+                               now=self.clock())
+        self.d.tick()
+
+    def test_off_by_default_never_opens_the_mouse(self):
+        os.remove(os.path.join(self.root, "config.json"))
+        self.d.load_config()
+        self.wait()
+        self.d.tick()
+        self.assertEqual((self.opens, self.fake.played), (0, []))
+
+    def test_each_agent_has_its_own_vibration(self):
+        self.wait("codex")
+        self.d.tick()
+        self.assertEqual(self.fake.played, [0x06])
+
+    def test_custom_and_invalid_waveforms(self):
+        self.configure(waveforms={"claude": "jingle", "codex": "nonsense"})
+        self.wait("claude")
+        self.d.tick()
+        self.advance(2)
+        self.wait("codex")
+        self.d.tick()
+        self.assertEqual(self.fake.played, [0x0D, 0x06])
+
+    def test_repeats_while_waiting_and_stops_after(self):
+        self.wait()
+        self.d.tick()
+        self.advance(10)
+        self.assertEqual(self.fake.played, [0x05])
+        self.advance(20)
+        self.assertEqual(self.fake.played, [0x05, 0x05])
+        self.store.drop("claude", "s")
+        self.d.tick()
+        self.assertTrue(self.fake.closed)
+        self.clock.t += 100
+        self.d.tick()
+        self.assertEqual(len(self.fake.played), 2)
+
+    def test_repeat_can_be_turned_off(self):
+        self.configure(repeat_seconds=0)
+        self.wait()
+        self.d.tick()
+        self.advance(100)
+        self.assertEqual(self.fake.played, [0x05])
+
+    def test_several_agents_take_turns(self):
+        self.wait("claude")
+        self.wait("codex")
+        self.d.tick()
+        self.assertEqual(self.fake.played, [0x05])
+        self.advance(0.5)
+        self.assertEqual(self.fake.played, [0x05])
+        self.advance(1.5)
+        self.assertEqual(self.fake.played, [0x05, 0x06])
+
+    def test_finished_turn_plays_once_when_done_is_on(self):
+        with open(os.path.join(self.root, "config.json"), "w") as f:
+            json.dump({"haptics": {"enabled": True}, "done": {"enabled": True, "seconds": 60}}, f)
+        self.d.load_config()
+        self.wait(state=ag.DONE)
+        self.d.tick()
+        self.advance(40)
+        self.assertEqual(self.fake.played, [0x07])
+
+    def test_unsupported_waveform_is_skipped_once(self):
+        self.fake.mask = 0
+        self.wait()
+        self.d.tick()
+        self.d.tick()
+        self.assertEqual(self.fake.played, [])
+        self.assertEqual(self.opens, 1)
+
+    def test_missing_mouse_is_retried_then_vibrates(self):
+        self.hid.present = False
+        self.wait()
+        self.d.tick()
+        self.d.tick()
+        self.assertEqual(self.opens, 1)
+        self.hid.present = True
+        self.advance(ag.RETRY_SECONDS)
+        self.assertEqual(self.fake.played, [0x05])
+        self.assertEqual(sum("haptic mouse not available" in line for line in self.logs), 1)
+
+    def test_an_unplugged_mouse_does_not_stop_the_daemon(self):
+        self.wait()
+        self.d.tick()
+        self.fake.alive = False
+        self.advance(30)
+        self.assertTrue(any("haptic mouse error" in line for line in self.logs))
+        self.assertIsNone(self.d.mouse)
+        self.fake.alive = True
+        self.advance(ag.RETRY_SECONDS)
+        self.assertEqual(self.fake.played, [0x05, 0x05])
+
+    def test_shutdown_closes_the_mouse(self):
+        self.wait()
+        self.d.tick()
+        self.d.shutdown()
+        self.assertTrue(self.fake.closed)
+
+    def test_config_values(self):
+        c = ag.Config({"haptics": {"enabled": "yes", "repeat_seconds": 99999}})
+        self.assertFalse(c.haptics_enabled)
+        self.assertEqual(c.haptic_repeat, 3600)
+        self.assertEqual(c.waveform_for(ag.NEEDS_INPUT, "someone"), "happy_alert")
+        self.assertEqual(c.waveform_for(ag.DONE, "claude"), "completed")
+
+    def test_devices_status_and_udev_rule(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENT_GLOW_HOME": self.root}), contextlib.redirect_stdout(out):
+            self.assertEqual(ag.cmd_devices([], hid_module=self.hid), 1)
+            ag.cmd_status([])
+            self.assertEqual(ag.cmd_udev_rule([], hid_module=self.hid), 0)
+        self.assertIn("046d:b042  Logitech MX Master 4: ready (haptics on)", out.getvalue())
+        self.assertIn("haptics   : on", out.getvalue())
+        self.assertIn('KERNELS=="0005:046D:*"', out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
