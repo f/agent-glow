@@ -19,8 +19,8 @@ Configuration and troubleshooting: https://github.com/f/agent-glow
 """
 # How it works: agent hooks only write a small marker file (stdlib only, always exit 0, never touch
 # the keyboard), so they cannot slow down or break an agent. The daemon watches the markers and
-# drives the keyboard over VIA raw HID. Every light change is a non-saving write, so the lighting
-# stored in the keyboard's EEPROM is never modified. The previous lighting is snapshotted first and
+# drives the keyboard over VIA raw HID or Logitech HID++. Every VIA light change is a non-saving
+# write, so the lighting stored in the keyboard's EEPROM is never modified. The previous lighting is snapshotted first and
 # put back when the alert ends; if the daemon dies mid-alert, the snapshot is restored on its next start.
 import json
 import os

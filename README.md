@@ -25,6 +25,8 @@ Logitech MX Keys keyboards (white backlight only, see [Logitech MX Keys](#logite
   - Its firmware must speak **VIA protocol 12 or newer** (QMK from 2023 on). `agent-glow devices`
     tells you if it doesn't.
   - Tested on an Omnitype keyboard (Mechlovin Zed65 Rev1 PCB, `4d4c:6505`).
+- **Or a Logitech MX Keys keyboard**, connected by Bluetooth or a Bolt/Unifying receiver. See
+  [Logitech MX Keys](#logitech-mx-keys).
 - **Python 3.9+** and git.
 - **macOS, Linux or Windows.** Only macOS has been tested on real hardware so far. Linux and Windows
   pass the automated tests, but please open an issue if anything misbehaves.
@@ -71,7 +73,7 @@ works. On Windows the command is `%USERPROFILE%\.agent-glow\bin\agent-glow.cmd`.
 | Option | |
 | --- | --- |
 | `--agents claude,codex` | Only register hooks for these agents. The default is all three. |
-| `--keyboard 4d4c:6505` | Use this keyboard instead of the first VIA keyboard found. |
+| `--keyboard 4d4c:6505` | Use this keyboard instead of the first usable keyboard found. |
 | `--no-service` | Don't start the daemon at login. Run `agent-glow daemon` yourself. |
 | `--no-venv` | Use the Python running the installer, which must have `hidapi` installed. |
 | `--uninstall` | Remove everything the installer added. |
@@ -88,8 +90,8 @@ if this is needed:
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Then unplug and replug the keyboard. The rule covers your keyboard's VID:PID only and uses
-`TAG+="uaccess"`, so it grants access to the logged-in user.
+Then unplug and replug the keyboard. The rule covers your keyboard's VID:PID only (for a Logitech keyboard, also
+every Logitech Bluetooth device) and uses `TAG+="uaccess"`, so it grants access to the logged-in user.
 
 ### Logitech MX Keys
 
@@ -183,7 +185,7 @@ agent hook ──► ~/.agent-glow/sessions/*.json ──► daemon ──VIA or
 ## Troubleshooting
 
 - **Nothing blinks.**
-  - Run `agent-glow devices`. It lists every VIA keyboard and why one can't be used.
+  - Run `agent-glow devices`. It lists every VIA and Logitech keyboard and why one can't be used.
   - Then run `agent-glow test` and check `~/.agent-glow/daemon.log`.
 - **`test` works but an agent doesn't trigger it.** Restart that agent's session. For Codex, trust the
   hooks in `/hooks`. `agent-glow status` shows the markers the hooks have written.
@@ -216,7 +218,7 @@ stays until you delete it.
 python3 -m unittest discover -s tests
 ```
 
-The tests run without a keyboard. They use a fake VIA device that behaves like QMK's `via.c`.
+The tests run without a keyboard. They use a fake Logitech device and a fake VIA device that behaves like QMK's `via.c`.
 
 ## License
 
