@@ -16,7 +16,8 @@ If several agents are waiting, each flash shows the next one's color. Colors, sp
 configurable, and an optional short "turn finished" flash is available.
 
 Built for Omnitype keyboards. It works with any QMK keyboard that has VIA and RGB lighting, and with
-Logitech MX Keys keyboards (white backlight only, see [Logitech MX Keys](#logitech-mx-keys)).
+Logitech MX Keys keyboards (white backlight only, see [Logitech MX Keys](#logitech-mx-keys)) and MacBook
+built-in keyboards (white backlight only, see [MacBook keyboards](#macbook-keyboards)).
 
 ## Requirements
 
@@ -27,6 +28,7 @@ Logitech MX Keys keyboards (white backlight only, see [Logitech MX Keys](#logite
   - Tested on an Omnitype keyboard (Mechlovin Zed65 Rev1 PCB, `4d4c:6505`).
 - **Or a Logitech MX Keys keyboard**, connected by Bluetooth or a Bolt/Unifying receiver. See
   [Logitech MX Keys](#logitech-mx-keys).
+- **Or a MacBook built-in keyboard.** See [MacBook keyboards](#macbook-keyboards).
 - **Python 3.9+** and git.
 - **macOS, Linux or Windows.** Only macOS has been tested on real hardware so far. Linux and Windows
   pass the automated tests, but please open an issue if anything misbehaves.
@@ -113,10 +115,23 @@ or VIA setup is needed, but they differ from RGB keyboards:
 - **A VIA keyboard takes priority** when both are connected. Pin one with `keyboard.vid` and `keyboard.pid`.
 - **Logi Options+ may also change the backlight** while it is running.
 
+### MacBook keyboards
+
+A MacBook's built-in backlight is used when no VIA keyboard is usable. To use it even with a VIA keyboard
+connected, set `"keyboard": { "lighting": "macbook" }`. Tested on a MacBook Pro with M4 (`Mac16,1`) on
+macOS 27.2.
+
+- **The backlight is white only.** Every agent blinks the same way, and the color settings are ignored.
+- **It can light up from dark,** so the alert still shows when the backlight is off.
+- **It relies on a private macOS API** (`KeyboardBrightnessClient`). If an update removes it, agent-glow
+  reports no MacBook keyboard instead of failing. Writes do not save, and your brightness is put back
+  after each alert.
+- **Apple's external Magic Keyboards are not supported,** because they have no backlight.
+
 ## Commands
 
 ```
-agent-glow devices                  list VIA and Logitech keyboards and whether agent-glow can drive them
+agent-glow devices                  list usable keyboards and whether agent-glow can drive them
 agent-glow test [AGENT|all|done] [SECONDS]
 agent-glow status                   daemon, keyboard and pending alerts
 agent-glow stop                     stop the daemon (the lighting is put back)
@@ -149,8 +164,8 @@ Create `~/.agent-glow/config.json`. Every key is optional, and the daemon picks 
 
 | Key | Meaning |
 | --- | --- |
-| `keyboard.vid` / `pid` | Which keyboard to use, as hex strings. Without them, the first usable keyboard is used (VIA first, then Logitech). |
-| `keyboard.lighting` | `auto`, `rgblight` or `rgb_matrix`. Set it if the keyboard has both and `auto` picks the wrong one. Logitech keyboards are only used with `auto`. |
+| `keyboard.vid` / `pid` | Which keyboard to use, as hex strings. Without them, the first usable keyboard is used (VIA first, then Logitech, then a MacBook's built-in keyboard). |
+| `keyboard.lighting` | `auto`, `rgblight`, `rgb_matrix` or `macbook`. Set it if the keyboard has both and `auto` picks the wrong one. Logitech keyboards are only used with `auto`. |
 | `agents` | Agents that may blink the keyboard. |
 | `blink_seconds` | Time on and time off per blink, from 0.1 to 5. |
 | `brightness` | Alert brightness, from 1 to 255. |
@@ -185,10 +200,12 @@ agent hook ──► ~/.agent-glow/sessions/*.json ──► daemon ──VIA or
 ## Troubleshooting
 
 - **Nothing blinks.**
-  - Run `agent-glow devices`. It lists every VIA and Logitech keyboard and why one can't be used.
+  - Run `agent-glow devices`. It lists every usable keyboard and why one can't be used.
   - Then run `agent-glow test` and check `~/.agent-glow/daemon.log`.
 - **`test` works but an agent doesn't trigger it.** Restart that agent's session. For Codex, trust the
   hooks in `/hooks`. `agent-glow status` shows the markers the hooks have written.
+- **`devices` does not list the MacBook keyboard.** It needs a Mac with a backlit built-in keyboard, and
+  a macOS version that still has the private API it uses.
 - **"VIA protocol N is too old".** Flash a current QMK build of your keyboard's `via` keymap.
 - **"does not expose RGB Light or RGB Matrix over VIA".** The firmware doesn't include VIA lighting
   control, so it can't be driven without a firmware change.

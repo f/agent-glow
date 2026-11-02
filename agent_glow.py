@@ -2,7 +2,7 @@
 """agent-glow: blink your keyboard's RGB when Claude Code, Codex or GitHub Copilot is waiting for you.
 
 Usage:
-  agent-glow devices                    list VIA and Logitech keyboards and whether agent-glow can drive them
+  agent-glow devices                    list usable keyboards and whether agent-glow can drive them
   agent-glow test [AGENT|all|done] [SECONDS]
                                         blink as if an agent were waiting (default: all, 5 seconds)
   agent-glow status                     daemon, keyboard and pending alerts
@@ -19,8 +19,9 @@ Configuration and troubleshooting: https://github.com/f/agent-glow
 """
 # How it works: agent hooks only write a small marker file (stdlib only, always exit 0, never touch
 # the keyboard), so they cannot slow down or break an agent. The daemon watches the markers and
-# drives the keyboard over VIA raw HID or Logitech HID++. Every VIA light change is a non-saving
-# write, so the lighting stored in the keyboard's EEPROM is never modified. The previous lighting is snapshotted first and
+# drives the keyboard over VIA raw HID, Logitech HID++ or a MacBook's backlight API. Every VIA and MacBook
+# light change is a non-saving write, so the lighting stored in the keyboard's EEPROM is never modified.
+# The previous lighting is snapshotted first and
 # put back when the alert ends; if the daemon dies mid-alert, the snapshot is restored on its next start.
 import json
 import os
@@ -53,6 +54,12 @@ HIDPP_SWID, HIDPP_TIMEOUT_MS = 0x0A, 1500
 BACKLIGHT2_HIGH, BACKLIGHT2_LOW = 0x19, 0x82
 BACKLIGHT_GET, BACKLIGHT_SET, BACKLIGHT_RANGE = 0, 1, 2
 BACKLIGHT_MANUAL, BACKLIGHT_MANUAL_BIT, BACKLIGHT_NO_EFFECT = 3, 0x20, 0xFF
+
+MACBOOK = "macbook"
+OBJC_LIBRARY = "/usr/lib/libobjc.A.dylib"
+COREBRIGHTNESS = "/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness"
+MAC_SELECTORS = (b"copyKeyboardBacklightIDs", b"isKeyboardBuiltIn:", b"brightnessForKeyboard:",
+                 b"setBrightness:fadeSpeed:commit:forKeyboard:")
 
 NEEDS_INPUT, DONE = "needs_input", "done"
 AGENTS = ("claude", "codex", "copilot")
@@ -676,6 +683,88 @@ class LogiKeyboard(Keyboard):
         self.write_config(s["speed"], s["effect"], s["brightness"])
 
 
+class MacBacklight:
+    def __init__(self, objc):
+        self.objc = objc
+        self.client, self.keyboard = None, None
+
+    def send(self, target, selector, restype, argtypes=(), *args):
+        import ctypes
+        call = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(("objc_msgSend", self.objc))
+        return call(target, self.objc.sel_registerName(selector), *args)
+
+    @classmethod
+    def find(cls):
+        if sys.platform != "darwin":
+            return None
+        import ctypes
+        try:
+            objc = ctypes.CDLL(OBJC_LIBRARY)
+            ctypes.CDLL(COREBRIGHTNESS)
+        except OSError:
+            return None
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.class_getInstanceMethod.restype = ctypes.c_void_p
+        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        klass = objc.objc_getClass(b"KeyboardBrightnessClient")
+        if not klass or not all(objc.class_getInstanceMethod(klass, objc.sel_registerName(s)) for s in MAC_SELECTORS):
+            return None
+        self = cls(objc)
+        pointer, ull = ctypes.c_void_p, ctypes.c_ulonglong
+        self.client = self.send(self.send(klass, b"alloc", pointer), b"init", pointer)
+        ids = self.send(self.client, b"copyKeyboardBacklightIDs", pointer) if self.client else None
+        for i in range(self.send(ids, b"count", ctypes.c_ulong) if ids else 0):
+            item = self.send(ids, b"objectAtIndex:", pointer, (ctypes.c_ulong,), i)
+            keyboard = self.send(item, b"unsignedLongLongValue", ull)
+            if self.send(self.client, b"isKeyboardBuiltIn:", ctypes.c_bool, (ull,), keyboard):
+                self.keyboard = keyboard
+                return self
+        return None
+
+    def brightness(self):
+        import ctypes
+        return self.send(self.client, b"brightnessForKeyboard:", ctypes.c_float, (ctypes.c_ulonglong,), self.keyboard)
+
+    def set_brightness(self, value):
+        import ctypes
+        if not self.send(self.client, b"setBrightness:fadeSpeed:commit:forKeyboard:", ctypes.c_bool,
+                         (ctypes.c_float, ctypes.c_int, ctypes.c_bool, ctypes.c_ulonglong),
+                         value, 0, False, self.keyboard):
+            raise KeyboardError("macOS refused the keyboard brightness change")
+
+
+class MacKeyboard:
+    id, name, lighting = "apple:builtin", "MacBook built-in keyboard", "backlight"
+    details = "macOS backlight, white only"
+
+    def __init__(self, backlight):
+        self.backlight = backlight
+
+    @classmethod
+    def open(cls):
+        backlight = MacBacklight.find()
+        return cls(backlight) if backlight else None
+
+    def close(self):
+        pass
+
+    def read_state(self):
+        return {"effect": 0, "brightness": round(self.backlight.brightness() * 255), "speed": 0, "hue": 0, "sat": 0}
+
+    def set(self, value_id, *values):
+        if value_id == ID_BRIGHTNESS:
+            self.backlight.set_brightness(values[0] / 255)
+
+    def alert(self, hue, sat, brightness):
+        self.set(ID_BRIGHTNESS, brightness)
+
+    def restore(self, s):
+        self.set(ID_BRIGHTNESS, s["brightness"])
+
+
 def same_lighting(live, wanted):
     return (all(live[k] == wanted[k] for k in ("effect", "speed", "hue", "sat"))
             and abs(live["brightness"] - wanted["brightness"]) <= BRIGHTNESS_SLACK)
@@ -701,7 +790,7 @@ class Config:
         colors = ni.get("colors") if isinstance(ni.get("colors"), dict) else {}
         agents = raw.get("agents")
         self.vid, self.pid = usb_id(kb.get("vid")), usb_id(kb.get("pid"))
-        self.lighting = kb.get("lighting") if kb.get("lighting") in LIGHTING else "auto"
+        self.lighting = kb.get("lighting") if kb.get("lighting") in (*LIGHTING, MACBOOK) else "auto"
         self.agents = tuple(a for a in agents if isinstance(a, str)) if isinstance(agents, list) else AGENTS
         self.blink = num(raw.get("blink_seconds"), 0.4, 0.1, 5)
         self.brightness = int(num(raw.get("brightness"), 255, 1, 255))
@@ -725,6 +814,8 @@ def load_config(root):
 
 
 def open_configured(config):
+    if config.lighting == MACBOOK:
+        return MacKeyboard.open()
     hid_module = load_hid()
     try:
         kb = Keyboard.open(hid_module, config.vid, config.pid, config.lighting)
@@ -736,6 +827,8 @@ def open_configured(config):
             kb = LogiKeyboard.open(hid_module, config.vid, config.pid)
         except KeyboardError as e:
             via_error = KeyboardError(f"{via_error}; {e}") if via_error else e
+    if kb is None and config.lighting == "auto" and not config.vid and not config.pid:
+        kb = MacKeyboard.open()
     if kb is None and via_error:
         raise via_error
     return kb
@@ -1086,10 +1179,11 @@ def cmd_devices(_args, hid_module=None):
         print(f"hidapi is not available ({e}); run install.py, or `pip install hidapi`")
         return 1
     cfg = load_config(state_root())
-    found = [(Keyboard, info) for info in via_interfaces(hid_module)]
+    found = [(Keyboard, info) for info in via_interfaces(hid_module)] if cfg.lighting != MACBOOK else []
     if cfg.lighting == "auto":
         found += [(LogiKeyboard, info) for info in hidpp_interfaces(hid_module)]
-    if not found:
+    mac = MacKeyboard.open() if cfg.lighting in ("auto", MACBOOK) else None
+    if not found and not mac:
         print("No VIA keyboard found. Connect it with a USB cable (wireless modes usually do not expose VIA)")
         print("and make sure it runs VIA-enabled QMK firmware.")
         print("No Logitech keyboard found either. Turn it on and connect it by Bluetooth or a Bolt receiver.")
@@ -1107,6 +1201,10 @@ def cmd_devices(_args, hid_module=None):
         else:
             cannot_open = cannot_open or reason.startswith("cannot open")
             print(f"    {device_id(info)}  {device_name(info)}: {reason}")
+    if mac:
+        use = chosen is None and not cfg.vid and not cfg.pid
+        chosen = mac.id if use else chosen
+        print(f"  {'*' if use else ' '} {mac.id}  {mac.name}: ready ({mac.details})")
     if chosen:
         print(f"\nagent-glow uses {chosen} (marked *).")
     elif cfg.vid or cfg.pid:

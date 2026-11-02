@@ -16,11 +16,18 @@ import agent_glow as ag  # noqa: E402
 
 SCRIPT = os.path.join(ROOT, "agent_glow.py")
 REAL_DAEMON = ag.Daemon
+REAL_MAC_FIND = ag.MacBacklight.__dict__["find"].__func__
 ORIGINAL = {"effect": 24, "brightness": 255, "speed": 3, "hue": 170, "sat": 255}
 ZED65 = "4d4c:6505"
 SNAP = dict(ORIGINAL, device=ZED65)
 RED, BLUE, GREEN = (0, 255), (170, 255), (85, 255)
 NAMES = {ag.ID_BRIGHTNESS: "brightness", ag.ID_EFFECT: "effect", ag.ID_SPEED: "speed"}
+
+
+def setUpModule():
+    patcher = mock.patch.object(ag.MacBacklight, "find", return_value=None)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 class FakeVia:
@@ -1461,6 +1468,97 @@ class LogitechKeyboard(unittest.TestCase):
             self.assertEqual(ag.cmd_udev_rule([], hid_module=hid), 0)
         self.assertIn('ATTRS{idVendor}=="046d", ATTRS{idProduct}=="b35b"', out.getvalue())
         self.assertIn('KERNELS=="0005:046D:*"', out.getvalue())
+
+
+class FakeMacBacklight:
+    def __init__(self, value=0.0):
+        self.value = value
+        self.writes = []
+
+    def brightness(self):
+        return self.value
+
+    def set_brightness(self, value):
+        self.value = value
+        self.writes.append(value)
+
+
+class MacbookKeyboard(unittest.TestCase):
+    def found(self, backlight):
+        return mock.patch.object(ag.MacBacklight, "find", return_value=backlight)
+
+    def test_blink_lights_up_from_dark_and_restores(self):
+        light = FakeMacBacklight(0.0)
+        kb = ag.MacKeyboard(light)
+        before = kb.read_state()
+        kb.alert(0, 255, 255)
+        kb.set(ag.ID_COLOR, 170, 255)
+        kb.set(ag.ID_BRIGHTNESS, 0)
+        kb.set(ag.ID_BRIGHTNESS, 255)
+        self.assertEqual(light.writes, [1.0, 0.0, 1.0])
+        kb.restore(before)
+        self.assertEqual(light.value, 0.0)
+        self.assertTrue(ag.same_lighting(kb.read_state(), before))
+
+    def test_daemon_blinks_and_restores_the_users_brightness(self):
+        light = FakeMacBacklight(0.5)
+        now = [100.0]
+        store = ag.Store(temp_dir(self))
+        with self.found(light):
+            daemon = REAL_DAEMON(store, lambda _cfg: ag.MacKeyboard.open(), mono=lambda: now[0],
+                                 logger=lambda _msg: None)
+            store.put("codex", "s", ag.MAIN, ag.NEEDS_INPUT)
+            daemon.tick()
+            self.assertEqual(light.value, 1.0)
+            now[0] += 1
+            daemon.tick()
+            self.assertEqual(light.value, 0.0)
+            store.drop("codex", "s")
+            daemon.tick()
+        self.assertAlmostEqual(light.value, 0.5, delta=0.01)
+        self.assertFalse(store.has_snapshot())
+
+    def test_used_last_unless_chosen_or_another_keyboard_is_pinned(self):
+        hid = FakeHid()
+        light = FakeMacBacklight()
+        with mock.patch.object(ag, "load_hid", lambda: hid), self.found(light):
+            self.assertEqual(ag.open_configured(ag.Config()).id, "apple:builtin")
+            self.assertIsNone(ag.open_configured(ag.Config({"keyboard": {"vid": "046d"}})))
+            self.assertIsNone(ag.open_configured(ag.Config({"keyboard": {"lighting": "rgblight"}})))
+            hid.add(FakeVia())
+            self.assertEqual(ag.open_configured(ag.Config()).id, ZED65)
+            chosen = ag.Config({"keyboard": {"lighting": "macbook"}})
+            self.assertEqual(chosen.lighting, "macbook")
+            self.assertEqual(ag.open_configured(chosen).id, "apple:builtin")
+
+    def test_a_broken_via_keyboard_falls_back_to_the_macbook(self):
+        hid = FakeHid(FakeVia(protocol=9))
+        with mock.patch.object(ag, "load_hid", lambda: hid), self.found(FakeMacBacklight()):
+            self.assertEqual(ag.open_configured(ag.Config()).id, "apple:builtin")
+
+    def test_a_logitech_keyboard_wins_over_the_macbook(self):
+        hid = FakeHid()
+        add_logi(hid, FakeLogi())
+        with mock.patch.object(ag, "load_hid", lambda: hid), self.found(FakeMacBacklight()):
+            self.assertEqual(ag.open_configured(ag.Config()).id, "046d:b35b")
+            self.assertEqual(ag.open_configured(ag.Config({"keyboard": {"lighting": "macbook"}})).id, "apple:builtin")
+
+    def test_devices_lists_it(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENT_GLOW_HOME": temp_dir(self)}), self.found(FakeMacBacklight()), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(ag.cmd_devices([], hid_module=FakeHid()), 0)
+        self.assertIn("* apple:builtin  MacBook built-in keyboard: ready", out.getvalue())
+        self.assertIn("agent-glow uses apple:builtin", out.getvalue())
+
+    def test_refused_write_raises(self):
+        backlight = ag.MacBacklight(None)
+        with mock.patch.object(backlight, "send", return_value=False), self.assertRaises(ag.KeyboardError):
+            backlight.set_brightness(1.0)
+
+    def test_not_found_on_other_platforms(self):
+        with mock.patch.object(ag.sys, "platform", "linux"):
+            self.assertIsNone(REAL_MAC_FIND(ag.MacBacklight))
 
 
 if __name__ == "__main__":
