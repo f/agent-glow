@@ -1757,6 +1757,7 @@ class HapticAlerts(unittest.TestCase):
     def test_finished_turn_plays_once_when_done_is_on(self):
         with open(os.path.join(self.root, "config.json"), "w") as f:
             json.dump({"haptics": {"enabled": True}, "done": {"enabled": True, "seconds": 60}}, f)
+        os.utime(os.path.join(self.root, "config.json"), (self.clock.t + 10, self.clock.t + 10))
         self.d.load_config()
         self.wait(state=ag.DONE)
         self.d.tick()
