@@ -914,7 +914,13 @@ def load_config(root):
 def open_configured(config):
     if config.lighting == MACBOOK:
         return MacKeyboard.open()
-    hid_module = load_hid()
+    try:
+        hid_module = load_hid()
+    except ImportError:
+        kb = MacKeyboard.open() if config.lighting == "auto" and not config.vid and not config.pid else None
+        if kb:
+            return kb
+        raise
     try:
         kb = Keyboard.open(hid_module, config.vid, config.pid, config.lighting)
         via_error = None

@@ -1536,6 +1536,18 @@ class MacbookKeyboard(unittest.TestCase):
         with mock.patch.object(ag, "load_hid", lambda: hid), self.found(FakeMacBacklight()):
             self.assertEqual(ag.open_configured(ag.Config()).id, "apple:builtin")
 
+    def test_missing_hidapi_falls_back_to_the_macbook(self):
+        def missing():
+            raise ImportError("No module named 'hid'")
+        with mock.patch.object(ag, "load_hid", missing):
+            with self.found(FakeMacBacklight()):
+                self.assertEqual(ag.open_configured(ag.Config()).id, "apple:builtin")
+                for pinned in ({"vid": "046d"}, {"lighting": "rgblight"}):
+                    with self.assertRaises(ImportError):
+                        ag.open_configured(ag.Config({"keyboard": pinned}))
+            with self.found(None), self.assertRaises(ImportError):
+                ag.open_configured(ag.Config())
+
     def test_a_logitech_keyboard_wins_over_the_macbook(self):
         hid = FakeHid()
         add_logi(hid, FakeLogi())
